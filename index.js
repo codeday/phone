@@ -3,12 +3,74 @@ const { GoogleSpreadsheet } = require('google-spreadsheet')
 const VoiceResponse = require('twilio').twiml.VoiceResponse
 const moment = require('moment-timezone');
 const express = require('express');
+const bodyParser = require('body-parser');
+const { phone } = require('phone');
 
 const app = express();
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json());
 
-function isBusinessHours() {
-    const currentHour = moment().utc().tz('America/Los_Angeles').hours();
-    return (currentHour >= 7 && currentHour < 17);
+const UPDATE_LOCALES_QUERY = `
+query PhoneLocales {
+  cms {
+    localizationConfigs {
+      items {
+        iso3166Alpha2Code
+        iso3166Alpha3Code
+        e164CountryCode
+        inboundPhoneNumbers
+        phoneGreetingAudio { contentfulBaseUrl }
+        phoneInvalidAudio { contentfulBaseUrl }
+        phoneConnectingAudio { contentfulBaseUrl }
+      }
+    }
+  }
+}
+`;
+let locales = [];
+let localesByAlpha2 = {};
+let localesByAlpha3 = {};
+let localesByE164 = {};
+let localesByInboundPhoneNumber = {};
+async function updateLocales() {
+  try {
+    const response = await fetch("https://graph.codeday.org/", {
+      body: JSON.stringify({ operationName: 'PhoneLocales', variables: {}, query: UPDATE_LOCALES_QUERY }),
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const data = await response.json();
+    locales = data.data.cms.localizationConfigs.items;
+    localesByAlpha2 = Object.fromEntries(locales.map(l => [l.iso3166Alpha2Code.toUpperCase(), l]));
+    localesByAlpha3 = Object.fromEntries(locales.map(l => [l.iso3166Alpha3Code.toUpperCase(), l]));
+    localesByE164 = Object.fromEntries(locales.map(l => [l.e164CountryCode, l]));
+    localesByInboundPhoneNumber = Object.fromEntries(locales.flatMap(l => (l.inboundPhoneNumbers || []).map(n => [n, l])));
+    console.log('Updated locales.');
+  } catch (ex) {
+    console.error('Could not update locales.');
+  }
+}
+
+function fetchLocaleConfig(req) {
+  const fromCountry = (req.query?.FromCountry || req.body?.FromCountry)?.toUpperCase();
+  const fromPhone = req.query?.From || req.body?.From;
+  const fromE164 = fromPhone ? phone(fromPhone)?.countryCode.slice(1) : null;
+  const to = req.query?.To || req.body?.To;
+
+  if (fromCountry && fromCountry.length == 2 && fromCountry in localesByAlpha2) {
+    return localesByAlpha2[fromCountry];
+  } else if (fromCountry && fromCountry.length == 3 && fromCountry in localesByAlpha3) {
+    return localesByAlpha3[fromCountry];
+  } else if (fromE164 && fromE164 in localesByE164) {
+    return localesByE164[fromE164];
+  } else if (to && to in localesByInboundPhoneNumber) {
+    return localesByInboundPhoneNumber[to];
+  } else {
+    return localesByAlpha2['US'];
+  }
 }
 
 async function getNumberForExtension(ext) {
@@ -37,10 +99,13 @@ async function googleLogin(sheet) {
 }
 
 app.all('/', async (req, res) => {
+  const { phoneGreetingAudio } = fetchLocaleConfig(req);
   const response = new VoiceResponse();
-  response
-      .gather({action: '/dial', method: 'GET'})
-      .play({loop:4}, 'https://f1.srnd.org/phone/codeday-greeting-2021-01.mp3');
+  const gather = response.gather({action: '/dial', method: 'GET'});
+  for (let i = 0; i < 3; i++) {
+    gather.play({}, phoneGreetingAudio.contentfulBaseUrl);
+    gather.pause({length: 3});
+  }
   response.hangup();
 
   res.send(response.toString());
@@ -48,15 +113,17 @@ app.all('/', async (req, res) => {
 
 app.all('/dial', async (req, res) => {
   try {
+    const { phoneInvalidAudio, phoneConnectingAudio } = fetchLocaleConfig(req);
     const digits = req.query.Digits.replace(/[^0-9]*/g, '');
     const response = new VoiceResponse();
     const phoneInfo = await getNumberForExtension(digits);
 
     if (phoneInfo && phoneInfo.number && phoneInfo.number.substr(0,3) === 'qa:') {
-      response.say({voice:"woman"}, 'Please stay on the line and we will connect you to callers as they join the queue.');
+      response.say({voice:"woman"}, 'You\'re connected to the queue.');
       response.dial().queue(phoneInfo.number.substr(3));
-      response.redirect();
+      response.redirect({ method: 'GET' }, `/dial?Digits=${req.query.Digits}`);
     } else if (phoneInfo && phoneInfo.number && phoneInfo.number.substr(0,2) === 'q:') {
+      response.say({voice:"woman"}, 'Please stay on the line and we will connect you as soon as we can.');
       response.enqueue({
         waitUrl: '/queue',
       }, phoneInfo.number.substr(2));
@@ -70,14 +137,14 @@ app.all('/dial', async (req, res) => {
         if (phoneInfo.direct && phoneInfo.direct !== "" && phoneInfo.direct !== "no") {
             response.dial().number(toDial);
         } else {
-            response.play('https://f1.codeday.org/phone/connecting.mp3');
+            response.play(phoneConnectingAudio.contentfulBaseUrl);
             response.dial().number({
                 url: 'https://codeday-phone.fly.dev/connect?connectFor='+encodeURIComponent(phoneInfo.description),
                 method: 'GET'
             }, toDial);
         }
     } else {
-        response.play('https://f1.codeday.org/phone/invalid.mp3');
+        response.play(phoneInvalidAudio.contentfulBaseUrl);
         response.redirect({method: 'get'}, '/phone');
     }
 
@@ -96,14 +163,6 @@ app.all('/connect', async (req, res) => {
     res.send(response.toString());
 });
 
-app.all('/codeday', async (req, res) => {
-    const response = new VoiceResponse();
-    response.play('https://f1.codeday.org/phone/codeday-closed.mp3');
-    res.send(response.toString());
-    response.hangup();
-    res.send(response.toString());
-});
-
 app.all('/queue', async (req, res) => {
   const response = new VoiceResponse();
   if (req.query.QueuePosition) {
@@ -113,5 +172,9 @@ app.all('/queue', async (req, res) => {
   res.send(response.toString());
 });
 
-const port = process.env.PORT || 8080;
-app.listen(port, () => console.log(`Listening on http://0.0.0.0:${port}`))
+(async () => {
+  await updateLocales();
+  setInterval(updateLocales, 1000 * 60 * 15);
+  const port = process.env.PORT || 8080;
+  app.listen(port, () => console.log(`Listening on http://0.0.0.0:${port}`))
+})();
